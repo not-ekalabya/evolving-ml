@@ -738,11 +738,6 @@ def run_evolution(
     crossover_rate=0.3,
     training_steps=100,
     val_batches=50,
-    depth_penalty=0.05,
-    invalid_penalty=0.5,
-    novelty_weight=0.05,
-    param_penalty_min=0.001,
-    param_penalty_max=0.02,
     seed=42,
     on_generation=None,
 ):
@@ -750,34 +745,21 @@ def run_evolution(
     rng = np.random.RandomState(seed)
 
     population = [build_minimal_model().to(device) for _ in range(population_size)]
-    baseline_nodes = len(population[0].execution_order)
-
-    prev_elite_signatures = []
     for gen in range(generations):
         scored = []
 
         for model in population:
             trained = train_brief(model, train_loader, device, steps=training_steps)
             params = count_parameters(model)
-            depth = max(0.0, (len(model.execution_order) - baseline_nodes) / max(1, baseline_nodes))
-            current_param_penalty = param_penalty_min + (param_penalty_max - param_penalty_min) * (gen / max(1, generations - 1))
             if not trained:
                 acc = 0.0
-                novelty = 0.0
-                fitness = -1e9 - current_param_penalty * np.log10(params + 1) - invalid_penalty
+                fitness = -1e9
             else:
                 acc = evaluate_accuracy(model, test_loader, device, max_batches=val_batches)
-                novelty = novelty_score(model, prev_elite_signatures)
-                fitness = (
-                    acc
-                    - current_param_penalty * np.log10(params + 1)
-                    - depth_penalty * depth
-                    + novelty_weight * novelty
-                )
+                fitness = acc
             scored.append((fitness, acc, params, model))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        prev_elite_signatures = [architecture_signature(s[3]) for s in scored[:max(1, elites)]]
         best_fitness, best_acc, best_params, best_model = scored[0]
         avg_acc = sum(s[1] for s in scored) / len(scored)
         max_nodes_model = max(scored, key=lambda x: len(x[3].execution_order))[3]
