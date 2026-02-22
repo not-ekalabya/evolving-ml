@@ -332,6 +332,35 @@ def clone_model(parent):
     return child
 
 
+def architecture_signature(model):
+    return "|".join(
+        [
+            f"{type(model.nodes[n]).__name__}:{getattr(model.nodes[n], 'activation_type', '')}"
+            f":{getattr(model.nodes[n], 'operation', '')}"
+            f":{getattr(model.nodes[n], 'mode', '')}"
+            f":{getattr(model.nodes[n], 'dim', '')}"
+            f":{getattr(model.nodes[n], 'W', None).shape if isinstance(model.nodes[n], MatMulNode) else ''}"
+            for n in model.execution_order
+        ]
+    )
+
+
+def novelty_score(model, elite_signatures):
+    if not elite_signatures:
+        return 0.0
+    sig = architecture_signature(model)
+    def dist(a, b):
+        # simple distance: proportion of non-matching tokens
+        ta = a.split("|")
+        tb = b.split("|")
+        m = min(len(ta), len(tb))
+        mismatch = sum(1 for i in range(m) if ta[i] != tb[i])
+        mismatch += abs(len(ta) - len(tb))
+        return mismatch / max(1, max(len(ta), len(tb)))
+    dists = [dist(sig, s) for s in elite_signatures]
+    return sum(dists) / len(dists)
+
+
 def _find_compatible_node(target, candidates, used):
     for name, node in candidates.items():
         if name in used:
@@ -709,7 +738,11 @@ def run_evolution(
     crossover_rate=0.3,
     training_steps=100,
     val_batches=50,
-    param_penalty=1e-6,
+    depth_penalty=0.05,
+    invalid_penalty=0.5,
+    novelty_weight=0.05,
+    param_penalty_min=0.001,
+    param_penalty_max=0.02,
     seed=42,
     on_generation=None,
 ):
@@ -717,22 +750,34 @@ def run_evolution(
     rng = np.random.RandomState(seed)
 
     population = [build_minimal_model().to(device) for _ in range(population_size)]
+    baseline_nodes = len(population[0].execution_order)
 
+    prev_elite_signatures = []
     for gen in range(generations):
         scored = []
 
         for model in population:
             trained = train_brief(model, train_loader, device, steps=training_steps)
             params = count_parameters(model)
+            depth = max(0.0, (len(model.execution_order) - baseline_nodes) / max(1, baseline_nodes))
+            current_param_penalty = param_penalty_min + (param_penalty_max - param_penalty_min) * (gen / max(1, generations - 1))
             if not trained:
                 acc = 0.0
-                fitness = -1e9 - param_penalty * params
+                novelty = 0.0
+                fitness = -1e9 - current_param_penalty * np.log10(params + 1) - invalid_penalty
             else:
                 acc = evaluate_accuracy(model, test_loader, device, max_batches=val_batches)
-                fitness = acc - param_penalty * params
+                novelty = novelty_score(model, prev_elite_signatures)
+                fitness = (
+                    acc
+                    - current_param_penalty * np.log10(params + 1)
+                    - depth_penalty * depth
+                    + novelty_weight * novelty
+                )
             scored.append((fitness, acc, params, model))
 
         scored.sort(key=lambda x: x[0], reverse=True)
+        prev_elite_signatures = [architecture_signature(s[3]) for s in scored[:max(1, elites)]]
         best_fitness, best_acc, best_params, best_model = scored[0]
         avg_acc = sum(s[1] for s in scored) / len(scored)
         max_nodes_model = max(scored, key=lambda x: len(x[3].execution_order))[3]
