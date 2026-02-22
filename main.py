@@ -617,8 +617,32 @@ def mutate_model(model, rng, force=None):
     return child
 
 
+def available_mutations(model):
+    # Structural ops can be attempted without shape probing; mutate_model will validate.
+    act_nodes = [n for n in model.execution_order if isinstance(model.nodes[n], ActivationNode)]
+    matmul_nodes = [n for n in model.execution_order if isinstance(model.nodes[n], MatMulNode)]
+    options = []
+    if matmul_nodes:
+        options.append("insert_layer")
+    if act_nodes:
+        options.append("change_activation")
+    if len(matmul_nodes) >= 3:
+        options.append("change_width")
+    options.append("add_skip")
+    options.append("add_concat")
+    return options
+
+
+def apply_mutation_action(model, rng, action):
+    options = available_mutations(model)
+    if action not in options:
+        return model, False
+    return mutate_model(model, rng, force=action), True
+
+
 def is_valid_model(model, device):
     try:
+        model.to(device)
         dummy = torch.zeros(2, 1, 28, 28, device=device)
         out = model(dummy)
         return out.ndim == 2 and out.shape[1] == 10
@@ -678,6 +702,39 @@ def evaluate_accuracy(model, loader, device, max_batches=50):
                 break
 
     return correct / max(1, total)
+
+
+def get_dataloaders(batch_size=64):
+    dataset = load_dataset("mnist")
+
+    def transform(example):
+        image = example["image"]
+        if isinstance(image, list):
+            image = np.stack([np.array(im, dtype=np.float32) for im in image], axis=0)
+        else:
+            image = np.array(image, dtype=np.float32)
+
+        image = torch.from_numpy(image) / 255.0
+
+        if image.ndim == 2:
+            image = image.unsqueeze(0)
+        elif image.ndim == 3:
+            if image.shape[0] != 1:
+                image = image.unsqueeze(1)
+
+        label = example["label"]
+        if isinstance(label, list):
+            label = torch.tensor(label, dtype=torch.long)
+        else:
+            label = torch.tensor(label, dtype=torch.long)
+
+        return {"image": image, "label": label}
+
+    dataset = dataset.with_transform(transform)
+
+    train_loader = DataLoader(dataset["train"], batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(dataset["test"], batch_size=batch_size)
+    return train_loader, test_loader
 
 
 # =========================
@@ -827,3 +884,4 @@ def run_evolution(
 
 if __name__ == "__main__":
     run_evolution()
+    
