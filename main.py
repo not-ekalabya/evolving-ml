@@ -329,6 +329,8 @@ def clone_model(parent):
         child_node = _clone_node_from(node)
         child_node.inputs = list(node.inputs)
         child.add_node(child_node)
+    if hasattr(child, "_last_mutation"):
+        delattr(child, "_last_mutation")
     return child
 
 
@@ -439,6 +441,7 @@ def mutate_model(model, rng, force=None):
     else:
         mutation_type = rng.choice(options)
 
+    child._last_mutation = mutation_type
     if mutation_type == "change_activation":
         if act_nodes:
             name = rng.choice(act_nodes)
@@ -656,6 +659,8 @@ def train_brief(model, loader, device, steps=100):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
     step = 0
+    best_loss = None
+    no_improve = 0
     for batch in loader:
         x = batch["image"].float().to(device)
         y = batch["label"].to(device)
@@ -666,16 +671,54 @@ def train_brief(model, loader, device, steps=100):
             x = x.unsqueeze(1)
 
         optimizer.zero_grad()
-        output = model(x)
+        try:
+            output = model(x)
+        except Exception:
+            return False
         loss = criterion(output, y)
         if not loss.requires_grad:
             return False
         loss.backward()
         optimizer.step()
 
+        loss_val = float(loss.detach().cpu())
+        if best_loss is None or loss_val < best_loss - 1e-4:
+            best_loss = loss_val
+            no_improve = 0
+        else:
+            no_improve += 1
+
         step += 1
-        if step >= steps:
+        if step >= steps or no_improve >= 5:
             break
+    return True
+
+
+def train_full(model, loader, device, epochs=3):
+    model.to(device)
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+    for _ in range(epochs):
+        for batch in loader:
+            x = batch["image"].float().to(device)
+            y = batch["label"].to(device)
+
+            if x.ndim == 4 and x.shape[0] == 1 and x.shape[1] != 1:
+                x = x.permute(1, 0, 2, 3)
+            if x.ndim == 3:
+                x = x.unsqueeze(1)
+
+            optimizer.zero_grad()
+            try:
+                output = model(x)
+            except Exception:
+                return False
+            loss = criterion(output, y)
+            if not loss.requires_grad:
+                return False
+            loss.backward()
+            optimizer.step()
     return True
 
 
@@ -693,7 +736,10 @@ def evaluate_accuracy(model, loader, device, max_batches=50):
             if x.ndim == 3:
                 x = x.unsqueeze(1)
 
-            output = model(x)
+            try:
+                output = model(x)
+            except Exception:
+                return 0.0
             pred = output.argmax(dim=1)
             correct += (pred == y).sum().item()
             total += y.size(0)
@@ -789,12 +835,14 @@ test_loader = DataLoader(
 
 def run_evolution(
     generations=20,
-    population_size=6,
-    elites=2,
-    mutation_rate=0.7,
+    population_size=16,
+    elites=4,
+    mutation_rate=0.9,
     crossover_rate=0.3,
     training_steps=100,
-    val_batches=50,
+    val_batches=20,
+    val_batches_fast=10,
+    eval_every=3,
     seed=42,
     on_generation=None,
 ):
@@ -806,13 +854,18 @@ def run_evolution(
         scored = []
 
         for model in population:
-            trained = train_brief(model, train_loader, device, steps=training_steps)
+            if not is_valid_model(model, device):
+                trained = False
+            else:
+                trained = train_brief(model, train_loader, device, steps=training_steps)
             params = count_parameters(model)
             if not trained:
                 acc = 0.0
                 fitness = -1e9
             else:
-                acc = evaluate_accuracy(model, test_loader, device, max_batches=val_batches)
+                use_full = (gen % eval_every == 0)
+                max_batches = val_batches if use_full else val_batches_fast
+                acc = evaluate_accuracy(model, test_loader, device, max_batches=max_batches)
                 fitness = acc
             scored.append((fitness, acc, params, model))
 
@@ -868,15 +921,22 @@ def run_evolution(
                 child = mutate_model(child, rng)
 
             child.to(device)
-            if not is_valid_model(child, device):
-                child = clone_model(fallback_parent).to(device)
+            last_mut = getattr(child, "_last_mutation", "")
+            if last_mut in {"add_skip", "add_concat"}:
+                if not is_valid_model(child, device):
+                    child = clone_model(fallback_parent).to(device)
             next_population.append(child)
 
         population = next_population
 
-    best = max(population, key=lambda m: evaluate_accuracy(m, test_loader, device, max_batches=val_batches))
+    valid_population = [m for m in population if is_valid_model(m, device)]
+    if not valid_population:
+        print("No valid models in final population.")
+        return None
+    best = max(valid_population, key=lambda m: evaluate_accuracy(m, test_loader, device, max_batches=val_batches))
+    _ = train_full(best, train_loader, device, epochs=3)
     final_acc = evaluate_accuracy(best, test_loader, device, max_batches=val_batches)
-    print("Final Best Accuracy:", final_acc)
+    print("Final Best Accuracy (after full train):", final_acc)
     print("Final Best Params:", count_parameters(best))
     print("Final Best Arch:", describe_architecture(best))
     return best
