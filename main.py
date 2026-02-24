@@ -1,994 +1,847 @@
-# Graph-Based AI Architecture for MNIST Classification
-# Using HuggingFace datasets library
+"""
+RL-Based Open-Ended Neural Architecture Search for MNIST
+=========================================================
+The controller operates on PRIMITIVE building blocks — the smallest meaningful
+neural operations. It can freely compose these into any architecture including
+MLPs, CNNs, RNNs, Attention, Transformers, ResNets, or entirely novel hybrids.
+
+The system discovers architectures entirely from scratch via:
+  - A graph-based architecture representation (DAG)
+  - A token-sequence controller (Transformer policy)
+  - REINFORCE with PPO-style clipping + entropy bonus
+
+Primitive Operations Available to the Controller
+─────────────────────────────────────────────────
+  LINEAR(in, out)          — Affine projection
+  CONV1D(in, out, k)       — 1D Convolution (patches of pixels)
+  LAYERNORM(d)             — Layer normalisation
+  BATCHNORM(d)             — Batch normalisation
+  RELU / GELU / SIGMOID    — Pointwise activations
+  DROPOUT(p)               — Stochastic regularisation
+  RESIDUAL(A, B)           — Skip connection: out = A(x) + B(x)
+  ATTENTION(d, h)          — Multi-head self-attention (Q=K=V=x)
+  FFN(d, expand)           — Feed-forward block (d → expand*d → d)
+  POOL(type)               — Mean / Max pooling across sequence
+  EMBED_PATCHES(d)         — Patch tokenisation (MNIST→sequence)
+  CONCAT(A, B)             — Concatenate two paths
+  ADD(A, B)                — Element-wise addition of two paths
+  IDENTITY                 — Pass-through (used in skip paths)
+
+The controller builds a sequence of "node specs" that are compiled into a
+runnable PyTorch module. Graph edges are implicit (each node takes input from
+one or more previous nodes, decided by the controller).
+
+Usage
+─────
+  pip install torch torchvision
+  python rl_nas_mnist_v2.py
+"""
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.distributions import Categorical
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Subset
 import numpy as np
-import os
+import random
 import json
-from datetime import datetime
-from torch.utils.data import DataLoader
-from datasets import load_dataset
-
-def get_device(use_directml=True, strict=True):
-    if use_directml:
-        try:
-            import torch_directml
-            return torch_directml.device()
-        except Exception:
-            if strict:
-                raise RuntimeError("torch_directml not available; cannot use DirectML GPU.")
-    return "cuda" if torch.cuda.is_available() else "cpu"
+import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Dict, Any
 
 
-# =========================
-# Primitive Node Definitions
-# =========================
+# ══════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class PrimitiveNode(nn.Module):
+CFG = {
+    # Search space
+    "max_nodes": 12,               # Maximum ops in the graph
+    "patch_size": 7,               # MNIST patches (28/7 = 4x4 = 16 patches)
+    "dim_choices": [32, 64, 128],  # Feature dimensions
+    "heads_choices": [1, 2, 4],    # Attention heads
+    "ffn_expand_choices": [2, 4],  # FFN expansion ratios
+    "dropout_choices": [0.0, 0.1, 0.2],
+    "conv_kernel_choices": [3, 5, 7],
 
-    def __init__(self, name):
+    # Controller
+    "ctrl_dim": 128,
+    "ctrl_heads": 4,
+    "ctrl_layers": 3,
+    "ctrl_lr": 2e-4,
+    "entropy_weight": 0.05,
+    "ppo_clip": 0.2,               # PPO-style update clipping
+    "baseline_decay": 0.9,
+
+    # Child training
+    "child_epochs": 3,
+    "child_lr": 5e-4,
+    "train_subset": 8000,
+    "val_subset": 2000,
+
+    # NAS
+    "nas_iterations": 30,
+    "top_k": 5,
+
+    # Final retraining
+    "final_epochs": 15,
+}
+
+# ══════════════════════════════════════════════════════════════════
+# OPERATION TOKEN VOCABULARY
+# Each op type is a token; parameters are additional categorical tokens.
+# ══════════════════════════════════════════════════════════════════
+
+OP_TYPES = [
+    "LINEAR",       # 0
+    "CONV1D",       # 1
+    "LAYERNORM",    # 2
+    "BATCHNORM",    # 3
+    "RELU",         # 4
+    "GELU",         # 5
+    "SIGMOID",      # 6
+    "DROPOUT",      # 7
+    "ATTENTION",    # 8
+    "FFN",          # 9
+    "POOL_MEAN",    # 10
+    "POOL_MAX",     # 11
+    "EMBED_PATCHES",# 12
+    "RESIDUAL",     # 13  (wraps the previous N ops as a block + skip)
+    "IDENTITY",     # 14
+    "STOP",         # 15  (end sequence)
+]
+OP_VOCAB_SIZE = len(OP_TYPES)
+OP2IDX = {op: i for i, op in enumerate(OP_TYPES)}
+
+
+@dataclass
+class NodeSpec:
+    op: str
+    dim: int = 64
+    heads: int = 2
+    ffn_expand: int = 2
+    dropout: float = 0.0
+    kernel: int = 3
+    residual_wrap: int = 0  # how many previous nodes to wrap in residual
+
+
+# ══════════════════════════════════════════════════════════════════
+# PRIMITIVE MODULES
+# ══════════════════════════════════════════════════════════════════
+
+class SelfAttention(nn.Module):
+    """Multi-head self-attention (no positional encoding — learned)."""
+    def __init__(self, dim, heads):
         super().__init__()
-        self.name = name
-        self.inputs = []
-
-    def add_input(self, node_name):
-        self.inputs.append(node_name)
-
-    def forward(self, tensors):
-        raise NotImplementedError
-
-
-class MatMulNode(PrimitiveNode):
-
-    def __init__(self, name, in_features, out_features, bias=True):
-        super().__init__(name)
-        self.W = nn.Parameter(torch.empty(in_features, out_features))
-        nn.init.kaiming_uniform_(self.W, a=np.sqrt(5))
-        if bias:
-            self.b = nn.Parameter(torch.zeros(out_features))
-        else:
-            self.b = None
-
-    def forward(self, tensors):
-        x = tensors[self.inputs[0]]
-        y = x @ self.W
-        if self.b is not None:
-            y = y + self.b
-        return y
-
-
-class AddNode(PrimitiveNode):
-
-    def __init__(self, name):
-        super().__init__(name)
-
-    def forward(self, tensors):
-        if len(self.inputs) != 2:
-            raise ValueError(f"AddNode '{self.name}' expects exactly 2 inputs.")
-        return tensors[self.inputs[0]] + tensors[self.inputs[1]]
-
-
-class ConcatNode(PrimitiveNode):
-
-    def __init__(self, name, dim=1):
-        super().__init__(name)
-        self.dim = dim
-
-    def forward(self, tensors):
-        if len(self.inputs) < 2:
-            raise ValueError(f"ConcatNode '{self.name}' expects at least 2 inputs.")
-        return torch.cat([tensors[n] for n in self.inputs], dim=self.dim)
-
-
-class ActivationNode(PrimitiveNode):
-
-    def __init__(self, name, activation_type):
-        super().__init__(name)
-        self.activation_type = activation_type.lower()
-        if self.activation_type not in {"relu", "gelu", "sigmoid", "tanh"}:
-            raise ValueError(f"Unsupported activation: {activation_type}")
-
-    def forward(self, tensors):
-        x = tensors[self.inputs[0]]
-        if self.activation_type == "relu":
-            return torch.relu(x)
-        if self.activation_type == "gelu":
-            return torch.nn.functional.gelu(x)
-        if self.activation_type == "sigmoid":
-            return torch.sigmoid(x)
-        return torch.tanh(x)
-
-
-class ReshapeNode(PrimitiveNode):
-
-    def __init__(self, name, operation, parameters=None):
-        super().__init__(name)
-        self.operation = operation
-        self.parameters = parameters
-
-    def forward(self, tensors):
-        x = tensors[self.inputs[0]]
-        if self.operation == "flatten":
-            return x.reshape(x.shape[0], -1)
-        if self.operation == "reshape":
-            return x.reshape(*self.parameters)
-        if self.operation == "permute":
-            return x.permute(*self.parameters)
-        raise ValueError(f"Unsupported reshape operation: {self.operation}")
-
-
-class ReduceNode(PrimitiveNode):
-
-    def __init__(self, name, operation, dim=None):
-        super().__init__(name)
-        self.operation = operation
-        self.dim = dim
-
-    def forward(self, tensors):
-        x = tensors[self.inputs[0]]
-        if self.operation == "mean":
-            return x.mean(dim=self.dim)
-        if self.operation == "sum":
-            return x.sum(dim=self.dim)
-        if self.operation == "max":
-            return x.max(dim=self.dim).values
-        raise ValueError(f"Unsupported reduce operation: {self.operation}")
-
-
-class IndexNode(PrimitiveNode):
-
-    def __init__(self, name, mode, parameters=None):
-        super().__init__(name)
-        self.mode = mode
-        self.parameters = parameters
-
-    def forward(self, tensors):
-        x = tensors[self.inputs[0]]
-        if self.mode == "gather":
-            dim, index = self.parameters
-            return torch.gather(x, dim, index)
-        if self.mode == "mask":
-            mask = self.parameters
-            return x[mask]
-        raise ValueError(f"Unsupported index mode: {self.mode}")
-
-
-# =========================
-# Graph Model
-# =========================
-
-class GraphModel(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-        self.nodes = nn.ModuleDict()
-        self.execution_order = []
-
-    def add_node(self, node):
-        self.nodes[node.name] = node
-        self.execution_order.append(node.name)
+        assert dim % heads == 0, f"dim {dim} must be divisible by heads {heads}"
+        self.heads = heads
+        self.scale = (dim // heads) ** -0.5
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim)
 
     def forward(self, x):
-
-        tensors = {}
-        tensors["input"] = x
-
-        for name in self.execution_order:
-            node = self.nodes[name]
-            tensors[name] = node(tensors)
-
-        return tensors[self.execution_order[-1]]
-
-
-def _is_compatible(node_a, node_b):
-    if type(node_a) is not type(node_b):
-        return False
-    if isinstance(node_a, MatMulNode):
-        return node_a.W.shape == node_b.W.shape and (node_a.b is None) == (node_b.b is None)
-    if isinstance(node_a, ActivationNode):
-        return node_a.activation_type == node_b.activation_type
-    if isinstance(node_a, ReshapeNode):
-        return node_a.operation == node_b.operation and node_a.parameters == node_b.parameters
-    if isinstance(node_a, ReduceNode):
-        return node_a.operation == node_b.operation and node_a.dim == node_b.dim
-    if isinstance(node_a, IndexNode):
-        return node_a.mode == node_b.mode and node_a.parameters == node_b.parameters
-    if isinstance(node_a, AddNode):
-        return True
-    if isinstance(node_a, ConcatNode):
-        return node_a.dim == node_b.dim
-    return False
-
-
-def _clone_node_from(parent_node):
-    if isinstance(parent_node, MatMulNode):
-        out_features = parent_node.W.shape[1]
-        in_features = parent_node.W.shape[0]
-        child = MatMulNode(parent_node.name, in_features, out_features, bias=parent_node.b is not None)
-        with torch.no_grad():
-            child.W.copy_(parent_node.W)
-            if child.b is not None:
-                child.b.copy_(parent_node.b)
-        return child
-    if isinstance(parent_node, ActivationNode):
-        return ActivationNode(parent_node.name, parent_node.activation_type)
-    if isinstance(parent_node, ReshapeNode):
-        return ReshapeNode(parent_node.name, parent_node.operation, parent_node.parameters)
-    if isinstance(parent_node, ReduceNode):
-        return ReduceNode(parent_node.name, parent_node.operation, parent_node.dim)
-    if isinstance(parent_node, IndexNode):
-        return IndexNode(parent_node.name, parent_node.mode, parent_node.parameters)
-    if isinstance(parent_node, AddNode):
-        return AddNode(parent_node.name)
-    if isinstance(parent_node, ConcatNode):
-        return ConcatNode(parent_node.name, dim=parent_node.dim)
-    raise ValueError(f"Unsupported node type for cloning: {type(parent_node)}")
-
-
-def _crossover_matmul(node_a, node_b):
-    out_features = node_a.W.shape[1]
-    in_features = node_a.W.shape[0]
-    child = MatMulNode(node_a.name, in_features, out_features, bias=node_a.b is not None)
-    alpha = torch.rand(1).item()
-    with torch.no_grad():
-        child.W.copy_(alpha * node_a.W + (1.0 - alpha) * node_b.W)
-        if child.b is not None:
-            child.b.copy_(alpha * node_a.b + (1.0 - alpha) * node_b.b)
-    return child
-
-
-def _crossover_activation(node_a, node_b):
-    if node_a.activation_type == node_b.activation_type:
-        return ActivationNode(node_a.name, node_a.activation_type)
-    chosen = node_a if torch.rand(1).item() < 0.5 else node_b
-    return ActivationNode(node_a.name, chosen.activation_type)
-
-
-def crossover_models(parent_a, parent_b):
-    if parent_a.execution_order != parent_b.execution_order:
-        raise ValueError("Parent graphs must have identical execution order to preserve topology.")
-
-    child = GraphModel()
-
-    for name in parent_a.execution_order:
-        node_a = parent_a.nodes[name]
-        node_b = parent_b.nodes.get(name, None)
-
-        if node_b is not None and _is_compatible(node_a, node_b):
-            if isinstance(node_a, MatMulNode):
-                child_node = _crossover_matmul(node_a, node_b)
-            elif isinstance(node_a, ActivationNode):
-                child_node = _crossover_activation(node_a, node_b)
-            else:
-                chosen = node_a if torch.rand(1).item() < 0.5 else node_b
-                child_node = _clone_node_from(chosen)
+        # x: (B, S, D) or (B, D) — handle both
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+            squeeze = True
         else:
-            chosen = node_a if node_b is None or torch.rand(1).item() < 0.5 else node_b
-            child_node = _clone_node_from(chosen)
+            squeeze = False
 
-        child_node.inputs = list(node_a.inputs)
-        child.add_node(child_node)
+        B, S, D = x.shape
+        qkv = self.qkv(x).reshape(B, S, 3, self.heads, D // self.heads)
+        q, k, v = qkv.unbind(2)                    # each (B, S, H, d)
+        q, k, v = [t.transpose(1, 2) for t in (q, k, v)]  # (B, H, S, d)
 
-    return child
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, S, D)
+        out = self.proj(out)
 
-
-# =========================
-# Evolution Utilities
-# =========================
-
-def build_minimal_model():
-
-    model = GraphModel()
-
-    flatten = ReshapeNode("flatten", "flatten", None)
-    flatten.add_input("input")
-    model.add_node(flatten)
-
-    fc_out = MatMulNode("fc_out", 784, 10, bias=True)
-    fc_out.add_input("flatten")
-    model.add_node(fc_out)
-
-    return model
+        if squeeze:
+            out = out.squeeze(1)
+        return out
 
 
-def forward_with_tensors(model, x):
-    tensors = {"input": x}
-    for name in model.execution_order:
-        tensors[name] = model.nodes[name](tensors)
-    return tensors
+class FFNBlock(nn.Module):
+    """Position-wise FFN: x → expand → GELU → contract."""
+    def __init__(self, dim, expand=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * expand),
+            nn.GELU(),
+            nn.Linear(dim * expand, dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
-def count_parameters(model):
+class PatchEmbedder(nn.Module):
+    """
+    Splits MNIST (1×28×28) into non-overlapping patches and projects each
+    to a d-dimensional embedding, giving a sequence of patch tokens.
+    """
+    def __init__(self, patch_size, dim):
+        super().__init__()
+        self.patch_size = patch_size
+        n_patches = (28 // patch_size) ** 2
+        patch_dim = patch_size * patch_size  # grayscale
+        self.proj = nn.Linear(patch_dim, dim)
+        self.pos = nn.Parameter(torch.randn(1, n_patches, dim) * 0.02)
+
+    def forward(self, x):
+        # x: (B, 1, 28, 28)
+        B = x.size(0)
+        p = self.patch_size
+        # Fold into patches
+        x = x.unfold(2, p, p).unfold(3, p, p)   # (B,1,H/p,W/p,p,p)
+        x = x.contiguous().view(B, -1, p * p)    # (B, n_patches, p*p)
+        x = self.proj(x) + self.pos
+        return x  # (B, seq, dim)
+
+
+class ResidualWrapper(nn.Module):
+    """Wraps a sub-network with a learnable skip connection."""
+    def __init__(self, block: nn.Module, in_dim: int, out_dim: int):
+        super().__init__()
+        self.block = block
+        self.skip = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x):
+        return self.block(x) + self.skip(x)
+
+
+class DimAdapter(nn.Module):
+    """Projects tensor to a target dimension if needed."""
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.proj = nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+# ══════════════════════════════════════════════════════════════════
+# ARCHITECTURE COMPILER
+# Turns a list of NodeSpecs into a runnable nn.Module
+# ══════════════════════════════════════════════════════════════════
+
+class CompiledNetwork(nn.Module):
+    """
+    Sequential DAG network compiled from NodeSpecs.
+    Manages dimensionality automatically between nodes.
+    """
+    def __init__(self, nodes: List[NodeSpec], patch_size: int = 7):
+        super().__init__()
+        self.patch_size = patch_size
+        self.ops = nn.ModuleList()
+        self.adapters = nn.ModuleList()
+        self.op_names = []
+        self.has_patches = False
+
+        cur_dim = 784    # flat MNIST default
+        cur_seq = 1      # sequence length (1 = flat, >1 = sequence)
+
+        i = 0
+        while i < len(nodes):
+            spec = nodes[i]
+            op_name = spec.op
+
+            if op_name == "STOP":
+                break
+
+            if op_name == "EMBED_PATCHES":
+                mod = PatchEmbedder(patch_size, spec.dim)
+                self.ops.append(mod)
+                self.adapters.append(nn.Identity())
+                self.op_names.append(("EMBED_PATCHES", spec.dim))
+                cur_dim = spec.dim
+                cur_seq = (28 // patch_size) ** 2
+                self.has_patches = True
+                i += 1
+                continue
+
+            if op_name == "RESIDUAL" and spec.residual_wrap > 0:
+                # Wrap previous `residual_wrap` ops in a residual block
+                wrap_n = min(spec.residual_wrap, len(self.ops))
+                if wrap_n > 0:
+                    # Replace last wrap_n ops with a residual wrapper
+                    inner_ops = list(self.ops[-wrap_n:])
+                    inner_adapters = list(self.adapters[-wrap_n:])
+                    inner_names = self.op_names[-wrap_n:]
+
+                    class InnerSeq(nn.Module):
+                        def __init__(self, ops, adapts, names):
+                            super().__init__()
+                            self.ops = nn.ModuleList(ops)
+                            self.adapts = nn.ModuleList(adapts)
+                            self.names = names
+
+                        def forward(self, x):
+                            for op, adapt, name in zip(self.ops, self.adapts, self.names):
+                                x = adapt(x)
+                                x = op(x)
+                            return x
+
+                    inner = InnerSeq(inner_ops, inner_adapters, inner_names)
+                    residual = ResidualWrapper(inner, cur_dim, cur_dim)
+
+                    self.ops = nn.ModuleList(list(self.ops)[:-wrap_n] + [residual])
+                    self.adapters = nn.ModuleList(list(self.adapters)[:-wrap_n] + [nn.Identity()])
+                    self.op_names = self.op_names[:-wrap_n] + [("RESIDUAL", cur_dim)]
+                i += 1
+                continue
+
+            # Compute adapter (dimension alignment) then build op
+            target_dim = spec.dim if op_name in ("LINEAR", "CONV1D", "ATTENTION", "FFN",
+                                                   "LAYERNORM", "BATCHNORM") else cur_dim
+
+            adapter = DimAdapter(cur_dim, target_dim) if cur_dim != target_dim else nn.Identity()
+
+            if op_name == "LINEAR":
+                mod = nn.Linear(target_dim, spec.dim)
+                out_dim = spec.dim
+            elif op_name == "CONV1D":
+                k = spec.kernel
+                pad = k // 2
+                mod = nn.Conv1d(target_dim, spec.dim, kernel_size=k, padding=pad)
+                out_dim = spec.dim
+            elif op_name == "LAYERNORM":
+                mod = nn.LayerNorm(target_dim)
+                out_dim = target_dim
+            elif op_name == "BATCHNORM":
+                mod = nn.BatchNorm1d(target_dim)
+                out_dim = target_dim
+            elif op_name == "RELU":
+                mod = nn.ReLU()
+                out_dim = target_dim
+            elif op_name == "GELU":
+                mod = nn.GELU()
+                out_dim = target_dim
+            elif op_name == "SIGMOID":
+                mod = nn.Sigmoid()
+                out_dim = target_dim
+            elif op_name == "DROPOUT":
+                mod = nn.Dropout(spec.dropout) if spec.dropout > 0 else nn.Identity()
+                out_dim = target_dim
+            elif op_name == "ATTENTION":
+                # Ensure divisibility
+                h = spec.heads
+                while target_dim % h != 0 and h > 1:
+                    h //= 2
+                mod = SelfAttention(target_dim, h)
+                out_dim = target_dim
+            elif op_name == "FFN":
+                mod = FFNBlock(target_dim, spec.ffn_expand)
+                out_dim = target_dim
+            elif op_name in ("POOL_MEAN", "POOL_MAX"):
+                mod = nn.Identity()  # handled in forward
+                out_dim = target_dim
+            elif op_name == "IDENTITY":
+                mod = nn.Identity()
+                out_dim = target_dim
+            else:
+                mod = nn.Identity()
+                out_dim = target_dim
+
+            self.ops.append(mod)
+            self.adapters.append(adapter)
+            self.op_names.append((op_name, out_dim))
+            cur_dim = out_dim
+            i += 1
+
+        # Final classifier head
+        self.classifier = nn.Linear(cur_dim, 10)
+        self.final_dim = cur_dim
+
+    def forward(self, x):
+        # x: (B, 1, 28, 28)
+        B = x.size(0)
+
+        if self.has_patches:
+            h = x  # PatchEmbedder handles raw images
+        else:
+            h = x.view(B, -1)  # flatten to (B, 784)
+
+        seq_mode = False  # are we in sequence (B, S, D) mode?
+
+        for (op_name, out_dim), adapter, op in zip(self.op_names, self.adapters, self.ops):
+            if op_name == "EMBED_PATCHES":
+                h = op(h)     # → (B, S, D)
+                seq_mode = True
+                continue
+
+            # Apply adapter
+            if seq_mode:
+                S = h.shape[1]
+                h_flat = h.reshape(B * S, -1)
+                if not isinstance(adapter, nn.Identity):
+                    h_flat = adapter(h_flat)
+                h = h_flat.reshape(B, S, -1)
+            else:
+                h = adapter(h)
+
+            # Apply op
+            if op_name == "CONV1D":
+                if seq_mode:
+                    # (B, S, D) → (B, D, S) for Conv1d → back
+                    h = op(h.transpose(1, 2)).transpose(1, 2)
+                else:
+                    h = h.unsqueeze(1)
+                    h = op(h.transpose(1, 2)).transpose(1, 2)
+                    h = h.squeeze(1)
+            elif op_name == "BATCHNORM":
+                if seq_mode:
+                    S = h.shape[1]
+                    h = op(h.reshape(B * S, -1)).reshape(B, S, -1)
+                else:
+                    h = op(h)
+            elif op_name == "POOL_MEAN":
+                if seq_mode:
+                    h = h.mean(dim=1)
+                    seq_mode = False
+            elif op_name == "POOL_MAX":
+                if seq_mode:
+                    h = h.max(dim=1).values
+                    seq_mode = False
+            elif op_name in ("RELU", "GELU", "SIGMOID", "DROPOUT", "IDENTITY", "LAYERNORM"):
+                if seq_mode:
+                    S = h.shape[1]
+                    if op_name in ("RELU", "GELU", "SIGMOID", "DROPOUT", "IDENTITY"):
+                        h = op(h)
+                    elif op_name == "LAYERNORM":
+                        h = op(h)
+                else:
+                    h = op(h)
+            else:
+                # ATTENTION, FFN, LINEAR, RESIDUAL
+                h = op(h)
+
+        # If still in seq mode, pool to get fixed-size repr
+        if seq_mode:
+            h = h.mean(dim=1)
+
+        # Flatten if needed
+        if h.dim() > 2:
+            h = h.reshape(B, -1)
+            if h.shape[1] != self.final_dim:
+                h = h[:, :self.final_dim]  # truncate
+
+        return self.classifier(h)
+
+
+def compile_architecture(nodes: List[NodeSpec], patch_size: int) -> Optional[nn.Module]:
+    """Try to compile; return None if invalid."""
+    try:
+        model = CompiledNetwork(nodes, patch_size=patch_size)
+        # Quick shape test
+        dummy = torch.zeros(2, 1, 28, 28)
+        out = model(dummy)
+        assert out.shape == (2, 10)
+        return model
+    except Exception as e:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════
+# CONTROLLER — Transformer-based Policy
+# ══════════════════════════════════════════════════════════════════
+
+class TransformerController(nn.Module):
+    """
+    Autoregressive Transformer controller.
+    At each step it predicts the next node's type and parameters.
+    Input: sequence of previously chosen op embeddings.
+    Output: distribution over next op type + param distributions.
+    """
+    def __init__(self, dim=128, heads=4, layers=3, max_nodes=12):
+        super().__init__()
+        self.dim = dim
+        self.max_nodes = max_nodes
+
+        # Token embeddings for op types
+        self.op_embed = nn.Embedding(OP_VOCAB_SIZE + 1, dim)  # +1 for start token
+
+        # Positional encoding
+        self.pos_embed = nn.Embedding(max_nodes + 1, dim)
+
+        # Transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=heads, dim_feedforward=dim * 4,
+            dropout=0.1, batch_first=True, norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=layers)
+
+        # Output heads
+        self.head_op = nn.Linear(dim, OP_VOCAB_SIZE)
+
+        # Param heads
+        self.head_dim = nn.Linear(dim, len(CFG["dim_choices"]))
+        self.head_heads = nn.Linear(dim, len(CFG["heads_choices"]))
+        self.head_ffn = nn.Linear(dim, len(CFG["ffn_expand_choices"]))
+        self.head_dropout = nn.Linear(dim, len(CFG["dropout_choices"]))
+        self.head_kernel = nn.Linear(dim, len(CFG["conv_kernel_choices"]))
+        self.head_residual = nn.Linear(dim, 4)  # wrap 0-3 previous nodes
+
+        self._init()
+
+    def _init(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self):
+        """
+        Autoregressively generate an architecture.
+        Returns: (nodes, log_probs_tensor, entropies_tensor)
+        """
+        START_TOKEN = OP_VOCAB_SIZE  # special start token id
+        token_ids = [START_TOKEN]
+        nodes = []
+        log_probs = []
+        entropies = []
+
+        for step in range(self.max_nodes):
+            # Build input sequence
+            seq = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(DEVICE)
+            pos = torch.arange(len(token_ids), dtype=torch.long).unsqueeze(0).to(DEVICE)
+
+            # Clip token ids to valid embedding range
+            seq = seq.clamp(0, OP_VOCAB_SIZE)
+
+            x = self.op_embed(seq) + self.pos_embed(pos)
+            x = self.transformer(x)
+            h = x[0, -1]  # last token hidden state
+
+            # ── Sample op type ──
+            op_logits = self.head_op(h)
+            op_dist = Categorical(logits=op_logits)
+            op_idx = op_dist.sample()
+            log_probs.append(op_dist.log_prob(op_idx))
+            entropies.append(op_dist.entropy())
+            op_name = OP_TYPES[op_idx.item()]
+
+            if op_name == "STOP":
+                break
+
+            # ── Sample parameters ──
+            def sample_head(head, choices):
+                logits = head(h)
+                dist = Categorical(logits=logits)
+                idx = dist.sample()
+                log_probs.append(dist.log_prob(idx))
+                entropies.append(dist.entropy())
+                return choices[idx.item()]
+
+            spec = NodeSpec(op=op_name)
+            spec.dim = sample_head(self.head_dim, CFG["dim_choices"])
+            spec.heads = sample_head(self.head_heads, CFG["heads_choices"])
+            spec.ffn_expand = sample_head(self.head_ffn, CFG["ffn_expand_choices"])
+            spec.dropout = sample_head(self.head_dropout, CFG["dropout_choices"])
+            spec.kernel = sample_head(self.head_kernel, CFG["conv_kernel_choices"])
+            spec.residual_wrap = sample_head(self.head_residual, [0, 1, 2, 3])
+
+            nodes.append(spec)
+            token_ids.append(op_idx.item())
+
+        if not nodes:
+            # Fallback: single linear layer
+            nodes = [NodeSpec(op="LINEAR", dim=64), NodeSpec(op="RELU")]
+
+        return nodes, torch.stack(log_probs), torch.stack(entropies)
+
+
+# ══════════════════════════════════════════════════════════════════
+# DATA
+# ══════════════════════════════════════════════════════════════════
+
+def get_data(train_n=None, val_n=None):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    train_full = datasets.MNIST("./data", train=True, download=True, transform=transform)
+    val_full = datasets.MNIST("./data", train=False, download=True, transform=transform)
+
+    train_n = train_n or len(train_full)
+    val_n = val_n or len(val_full)
+
+    train_idx = random.sample(range(len(train_full)), min(train_n, len(train_full)))
+    val_idx = random.sample(range(len(val_full)), min(val_n, len(val_full)))
+
+    train_loader = DataLoader(Subset(train_full, train_idx), batch_size=128, shuffle=True, num_workers=0)
+    val_loader = DataLoader(Subset(val_full, val_idx), batch_size=256, shuffle=False, num_workers=0)
+    return train_loader, val_loader
+
+
+# ══════════════════════════════════════════════════════════════════
+# CHILD TRAINING & EVALUATION
+# ══════════════════════════════════════════════════════════════════
+
+def train_and_eval(model: nn.Module, train_loader, val_loader,
+                   epochs=3, lr=5e-4) -> float:
+    model = model.to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(epochs):
+        for X, y in train_loader:
+            X, y = X.to(DEVICE), y.to(DEVICE)
+            optimizer.zero_grad()
+            try:
+                out = model(X)
+                loss = criterion(out, y)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            except Exception:
+                continue
+        scheduler.step()
+
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for X, y in val_loader:
+            X, y = X.to(DEVICE), y.to(DEVICE)
+            try:
+                preds = model(X).argmax(1)
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+            except Exception:
+                pass
+
+    return correct / total if total > 0 else 0.0
+
+
+# ══════════════════════════════════════════════════════════════════
+# ARCHITECTURE → DESCRIPTION
+# ══════════════════════════════════════════════════════════════════
+
+def arch_description(nodes: List[NodeSpec]) -> str:
+    parts = []
+    for n in nodes:
+        if n.op in ("ATTENTION",):
+            parts.append(f"ATTN(d={n.dim},h={n.heads})")
+        elif n.op == "FFN":
+            parts.append(f"FFN(d={n.dim},x{n.ffn_expand})")
+        elif n.op in ("LINEAR",):
+            parts.append(f"LINEAR({n.dim})")
+        elif n.op == "CONV1D":
+            parts.append(f"CONV1D({n.dim},k={n.kernel})")
+        elif n.op == "RESIDUAL":
+            parts.append(f"RESIDUAL(wrap={n.residual_wrap})")
+        elif n.op == "DROPOUT":
+            parts.append(f"DROP({n.dropout})")
+        elif n.op == "EMBED_PATCHES":
+            parts.append(f"PATCHES(d={n.dim})")
+        else:
+            parts.append(n.op)
+    return " → ".join(parts)
+
+
+def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def describe_architecture(model):
-    parts = []
-    for name in model.execution_order:
-        node = model.nodes[name]
-        if isinstance(node, ReshapeNode):
-            parts.append(f"{name}:Reshape({node.operation})")
-        elif isinstance(node, MatMulNode):
-            parts.append(f"{name}:MatMul({node.W.shape[0]}->{node.W.shape[1]})")
-        elif isinstance(node, ActivationNode):
-            parts.append(f"{name}:Act({node.activation_type})")
-        elif isinstance(node, AddNode):
-            parts.append(f"{name}:Add")
-        elif isinstance(node, ConcatNode):
-            parts.append(f"{name}:Concat(dim={node.dim})")
-        elif isinstance(node, ReduceNode):
-            parts.append(f"{name}:Reduce({node.operation})")
-        elif isinstance(node, IndexNode):
-            parts.append(f"{name}:Index({node.mode})")
+# ══════════════════════════════════════════════════════════════════
+# MAIN NAS LOOP
+# ══════════════════════════════════════════════════════════════════
+
+def run_nas():
+    print(f"\n{'═'*65}")
+    print("   Open-Ended RL Neural Architecture Search — MNIST")
+    print(f"   Device: {DEVICE}")
+    print(f"   Search space: {len(OP_TYPES)} primitive ops, up to {CFG['max_nodes']} nodes")
+    print(f"{'═'*65}\n")
+
+    train_loader, val_loader = get_data(CFG["train_subset"], CFG["val_subset"])
+
+    controller = TransformerController(
+        dim=CFG["ctrl_dim"],
+        heads=CFG["ctrl_heads"],
+        layers=CFG["ctrl_layers"],
+        max_nodes=CFG["max_nodes"],
+    ).to(DEVICE)
+
+    ctrl_optim = optim.Adam(controller.parameters(), lr=CFG["ctrl_lr"])
+
+    baseline = None
+    history = []
+    best_archs = []  # (accuracy, arch_desc, nodes, param_count)
+    failed = 0
+
+    for it in range(1, CFG["nas_iterations"] + 1):
+        print(f"{'─'*65}")
+        print(f"  Iteration {it}/{CFG['nas_iterations']}")
+
+        # ── 1. Sample architecture ──
+        controller.eval()
+        with torch.no_grad():
+            # We need grads for controller update, so sample with grad
+            pass
+
+        nodes, log_probs, entropies = controller()
+        desc = arch_description(nodes)
+        print(f"  Architecture: {desc}")
+
+        # ── 2. Compile ──
+        model = compile_architecture(nodes, CFG["patch_size"])
+        if model is None:
+            print(f"  ⚠ Invalid architecture — skipping\n")
+            failed += 1
+            # Small negative reward nudge for invalid archs
+            reward = 0.1
         else:
-            parts.append(f"{name}:{type(node).__name__}")
-    return " -> ".join(parts)
-
-
-def serialize_model(model):
-    nodes = {}
-    for name in model.execution_order:
-        node = model.nodes[name]
-        entry = {
-            "type": type(node).__name__,
-            "inputs": list(node.inputs),
-        }
-        if isinstance(node, MatMulNode):
-            entry["in_features"] = int(node.W.shape[0])
-            entry["out_features"] = int(node.W.shape[1])
-            entry["bias"] = node.b is not None
-        elif isinstance(node, ActivationNode):
-            entry["activation_type"] = node.activation_type
-        elif isinstance(node, ReshapeNode):
-            entry["operation"] = node.operation
-            entry["parameters"] = node.parameters
-        elif isinstance(node, ReduceNode):
-            entry["operation"] = node.operation
-            entry["dim"] = node.dim
-        elif isinstance(node, IndexNode):
-            entry["mode"] = node.mode
-            entry["parameters"] = node.parameters
-        elif isinstance(node, ConcatNode):
-            entry["dim"] = node.dim
-        nodes[name] = entry
-    return {
-        "execution_order": list(model.execution_order),
-        "nodes": nodes,
-        "last_mutation": getattr(model, "_last_mutation", None),
-    }
-
-
-def clone_model(parent):
-    child = GraphModel()
-    for name in parent.execution_order:
-        node = parent.nodes[name]
-        child_node = _clone_node_from(node)
-        child_node.inputs = list(node.inputs)
-        child.add_node(child_node)
-    if hasattr(child, "_last_mutation"):
-        delattr(child, "_last_mutation")
-    return child
-
-
-def architecture_signature(model):
-    return "|".join(
-        [
-            f"{type(model.nodes[n]).__name__}:{getattr(model.nodes[n], 'activation_type', '')}"
-            f":{getattr(model.nodes[n], 'operation', '')}"
-            f":{getattr(model.nodes[n], 'mode', '')}"
-            f":{getattr(model.nodes[n], 'dim', '')}"
-            f":{getattr(model.nodes[n], 'W', None).shape if isinstance(model.nodes[n], MatMulNode) else ''}"
-            for n in model.execution_order
-        ]
-    )
-
-
-def novelty_score(model, elite_signatures):
-    if not elite_signatures:
-        return 0.0
-    sig = architecture_signature(model)
-    def dist(a, b):
-        # simple distance: proportion of non-matching tokens
-        ta = a.split("|")
-        tb = b.split("|")
-        m = min(len(ta), len(tb))
-        mismatch = sum(1 for i in range(m) if ta[i] != tb[i])
-        mismatch += abs(len(ta) - len(tb))
-        return mismatch / max(1, max(len(ta), len(tb)))
-    dists = [dist(sig, s) for s in elite_signatures]
-    return sum(dists) / len(dists)
-
-
-def _find_compatible_node(target, candidates, used):
-    for name, node in candidates.items():
-        if name in used:
-            continue
-        if _is_compatible(target, node):
-            return name, node
-    return None, None
-
-
-def crossover_models_flexible(parent_a, parent_b):
-    # Preserve topology of parent A, align compatible nodes from parent B
-    child = GraphModel()
-    used_b = set()
-
-    for name in parent_a.execution_order:
-        node_a = parent_a.nodes[name]
-        node_b = parent_b.nodes[name] if name in parent_b.nodes else None
-
-        if node_b is None or not _is_compatible(node_a, node_b):
-            _, node_b = _find_compatible_node(node_a, parent_b.nodes, used_b)
-
-        if node_b is not None and _is_compatible(node_a, node_b):
-            used_b.add(node_b.name)
-            if isinstance(node_a, MatMulNode):
-                child_node = _crossover_matmul(node_a, node_b)
-            elif isinstance(node_a, ActivationNode):
-                child_node = _crossover_activation(node_a, node_b)
-            else:
-                chosen = node_a if torch.rand(1).item() < 0.5 else node_b
-                child_node = _clone_node_from(chosen)
-        else:
-            chosen = node_a if torch.rand(1).item() < 0.5 else (parent_b.nodes[name] if name in parent_b.nodes else node_a)
-            child_node = _clone_node_from(chosen)
-
-        child_node.inputs = list(node_a.inputs)
-        child.add_node(child_node)
-
-    return child
-
-
-def mutate_model(model, rng, force=None):
-    # Mutations operate on a cloned model
-    child = clone_model(model)
-
-    # Use a dummy forward to infer shapes
-    dummy = torch.zeros(2, 1, 28, 28)
-    try:
-        tensors = forward_with_tensors(child, dummy)
-    except Exception:
-        return child
-
-    act_nodes = [n for n in child.execution_order if isinstance(child.nodes[n], ActivationNode)]
-    matmul_nodes = [n for n in child.execution_order if isinstance(child.nodes[n], MatMulNode)]
-    has_2d_nodes = any(t.ndim == 2 for t in tensors.values())
-
-    options = []
-    if matmul_nodes:
-        options.append("insert_layer")
-    if act_nodes:
-        options.append("change_activation")
-    if len(matmul_nodes) >= 3:
-        options.append("change_width")
-    if has_2d_nodes and len(child.execution_order) >= 3:
-        options.append("add_skip")
-    if has_2d_nodes and len(child.execution_order) >= 3:
-        options.append("add_concat")
-
-    if not options:
-        return child
-
-    # Bias toward growth when the graph is shallow
-    if force in options:
-        mutation_type = force
-    elif len(matmul_nodes) <= 1 and "insert_layer" in options:
-        mutation_type = "insert_layer" if rng.rand() < 0.8 else rng.choice(options)
-    else:
-        mutation_type = rng.choice(options)
-
-    child._last_mutation = mutation_type
-    if mutation_type == "change_activation":
-        if act_nodes:
-            name = rng.choice(act_nodes)
-            node = child.nodes[name]
-            new_act = rng.choice(["relu", "gelu", "sigmoid", "tanh"])
-            node.activation_type = new_act
-        return child
-
-    if mutation_type == "insert_layer":
-        # Insert a MatMul + Activation before the final MatMul output
-        if not matmul_nodes:
-            return child
-        last_mm = matmul_nodes[-1]
-        last_idx = child.execution_order.index(last_mm)
-        if last_idx == 0:
-            return child
-        prev_name = child.execution_order[last_idx - 1]
-        prev_tensor = tensors[prev_name]
-        if prev_tensor.ndim != 2:
-            return child
-        in_features = prev_tensor.shape[1]
-        new_width = int(rng.choice([32, 64, 128, 192, 256]))
-
-        mm_name = f"mm_ins_{rng.randint(0, 10**6)}"
-        act_name = f"act_ins_{rng.randint(0, 10**6)}"
-
-        mm = MatMulNode(mm_name, in_features, new_width, bias=True)
-        mm.add_input(prev_name)
-        act = ActivationNode(act_name, rng.choice(["relu", "gelu", "sigmoid", "tanh"]))
-        act.add_input(mm_name)
-
-        # Replace last MatMul to accept new width
-        last_node = child.nodes[last_mm]
-        new_last = MatMulNode(last_mm, new_width, last_node.W.shape[1], bias=last_node.b is not None)
-        new_last.inputs = list(last_node.inputs)
-
-        child.nodes[last_mm] = new_last
-
-        # Rewire last MatMul input to activation
-        new_last.inputs = [act_name]
-
-        # Insert into execution order
-        child.execution_order = (
-            child.execution_order[:last_idx] + [mm_name, act_name] + child.execution_order[last_idx:]
-        )
-        child.nodes[mm_name] = mm
-        child.nodes[act_name] = act
-        return child
-
-    if mutation_type == "change_width":
-        # Pick a MatMul that isn't the final output and adjust width with downstream fix
-        if len(matmul_nodes) < 3:
-            return child
-        idx = rng.randint(0, len(matmul_nodes) - 1)
-        mm_name = matmul_nodes[idx]
-        next_mm_name = matmul_nodes[idx + 1]
-
-        mm_node = child.nodes[mm_name]
-        next_node = child.nodes[next_mm_name]
-
-        new_width = int(rng.choice([32, 64, 128, 192, 256]))
-
-        new_mm = MatMulNode(mm_name, mm_node.W.shape[0], new_width, bias=mm_node.b is not None)
-        new_mm.inputs = list(mm_node.inputs)
-        child.nodes[mm_name] = new_mm
-
-        new_next = MatMulNode(next_mm_name, new_width, next_node.W.shape[1], bias=next_node.b is not None)
-        new_next.inputs = list(next_node.inputs)
-        child.nodes[next_mm_name] = new_next
-
-        return child
-
-    if mutation_type == "add_skip":
-        # Add skip connection via AddNode, with projection if needed
-        if len(child.execution_order) < 3:
-            return child
-
-        src_idx = rng.randint(0, len(child.execution_order) - 3)
-        tgt_idx = rng.randint(src_idx + 1, len(child.execution_order) - 2)
-        src_name = child.execution_order[src_idx]
-        tgt_name = child.execution_order[tgt_idx]
-
-        src_tensor = tensors[src_name]
-        tgt_tensor = tensors[tgt_name]
-
-        if src_tensor.ndim != 2 or tgt_tensor.ndim != 2:
-            return child
-
-        add_name = f"add_{rng.randint(0, 10**6)}"
-        proj_name = f"proj_{rng.randint(0, 10**6)}"
-
-        if src_tensor.shape[1] != tgt_tensor.shape[1]:
-            proj = MatMulNode(proj_name, src_tensor.shape[1], tgt_tensor.shape[1], bias=False)
-            proj.add_input(src_name)
-            child.nodes[proj_name] = proj
-            proj_input = proj_name
-            insert_after = tgt_idx
-            insert_nodes = [proj_name, add_name]
-        else:
-            proj_input = src_name
-            insert_after = tgt_idx
-            insert_nodes = [add_name]
-
-        add = AddNode(add_name)
-        add.inputs = [tgt_name, proj_input]
-        child.nodes[add_name] = add
-
-        # Rewire downstream nodes that used tgt_name to use add_name
-        for name in child.execution_order[tgt_idx + 1:]:
-            node = child.nodes[name]
-            node.inputs = [add_name if x == tgt_name else x for x in node.inputs]
-
-        # Insert new nodes after target
-        child.execution_order = (
-            child.execution_order[:insert_after + 1] + insert_nodes + child.execution_order[insert_after + 1:]
-        )
-
-        return child
-
-    if mutation_type == "add_concat":
-        if len(child.execution_order) < 3:
-            return child
-
-        idxs = [i for i, n in enumerate(child.execution_order) if tensors[n].ndim == 2]
-        if len(idxs) < 2:
-            return child
-
-        src_idx1 = rng.choice(idxs)
-        src_idx2 = rng.choice([i for i in idxs if i != src_idx1])
-        if src_idx1 > src_idx2:
-            src_idx1, src_idx2 = src_idx2, src_idx1
-
-        tgt_candidates = [
-            i
-            for i in idxs
-            if i > src_idx2 and len(child.nodes[child.execution_order[i]].inputs) == 1
-        ]
-        if not tgt_candidates:
-            return child
-        tgt_idx = rng.choice(tgt_candidates)
-
-        src1 = child.execution_order[src_idx1]
-        src2 = child.execution_order[src_idx2]
-        tgt_name = child.execution_order[tgt_idx]
-
-        src1_tensor = tensors[src1]
-        src2_tensor = tensors[src2]
-        tgt_tensor = tensors[tgt_name]
-
-        if src1_tensor.shape[0] != src2_tensor.shape[0]:
-            return child
-
-        concat_name = f"concat_{rng.randint(0, 10**6)}"
-        proj_name = f"proj_{rng.randint(0, 10**6)}"
-
-        concat = ConcatNode(concat_name, dim=1)
-        concat.inputs = [src1, src2]
-        child.nodes[concat_name] = concat
-
-        concat_width = src1_tensor.shape[1] + src2_tensor.shape[1]
-        proj = MatMulNode(proj_name, concat_width, tgt_tensor.shape[1], bias=True)
-        proj.add_input(concat_name)
-        child.nodes[proj_name] = proj
-
-        # Rewire target to take projection
-        tgt_node = child.nodes[tgt_name]
-        tgt_node.inputs = [proj_name]
-
-        # Insert concat and proj before target
-        child.execution_order = (
-            child.execution_order[:tgt_idx] + [concat_name, proj_name] + child.execution_order[tgt_idx:]
-        )
-
-        return child
-
-    return child
-
-
-def available_mutations(model):
-    # Structural ops can be attempted without shape probing; mutate_model will validate.
-    act_nodes = [n for n in model.execution_order if isinstance(model.nodes[n], ActivationNode)]
-    matmul_nodes = [n for n in model.execution_order if isinstance(model.nodes[n], MatMulNode)]
-    options = []
-    if matmul_nodes:
-        options.append("insert_layer")
-    if act_nodes:
-        options.append("change_activation")
-    if len(matmul_nodes) >= 3:
-        options.append("change_width")
-    options.append("add_skip")
-    options.append("add_concat")
-    return options
-
-
-def apply_mutation_action(model, rng, action):
-    options = available_mutations(model)
-    if action not in options:
-        return model, False
-    return mutate_model(model, rng, force=action), True
-
-
-def is_valid_model(model, device):
-    try:
-        model.to(device)
-        dummy = torch.zeros(2, 1, 28, 28, device=device)
-        out = model(dummy)
-        return out.ndim == 2 and out.shape[1] == 10
-    except Exception:
-        return False
-
-
-def train_brief(model, loader, device, steps=100):
-    model.to(device)
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
-    step = 0
-    best_loss = None
-    no_improve = 0
-    for batch in loader:
-        x = batch["image"].float().to(device)
-        y = batch["label"].to(device)
-
-        if x.ndim == 4 and x.shape[0] == 1 and x.shape[1] != 1:
-            x = x.permute(1, 0, 2, 3)
-        if x.ndim == 3:
-            x = x.unsqueeze(1)
-
-        optimizer.zero_grad()
-        try:
-            output = model(x)
-        except Exception:
-            return False, step
-        loss = criterion(output, y)
-        if not loss.requires_grad:
-            return False, step
-        loss.backward()
-        optimizer.step()
-
-        loss_val = float(loss.detach().cpu())
-        if best_loss is None or loss_val < best_loss - 1e-4:
-            best_loss = loss_val
-            no_improve = 0
-        else:
-            no_improve += 1
-
-        step += 1
-        if step >= steps or no_improve >= 5:
-            break
-    return True, step
-
-
-def train_full(model, loader, device, epochs=3):
-    model.to(device)
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
-    for _ in range(epochs):
-        for batch in loader:
-            x = batch["image"].float().to(device)
-            y = batch["label"].to(device)
-
-            if x.ndim == 4 and x.shape[0] == 1 and x.shape[1] != 1:
-                x = x.permute(1, 0, 2, 3)
-            if x.ndim == 3:
-                x = x.unsqueeze(1)
-
-            optimizer.zero_grad()
-            try:
-                output = model(x)
-            except Exception:
-                return False
-            loss = criterion(output, y)
-            if not loss.requires_grad:
-                return False
-            loss.backward()
-            optimizer.step()
-    return True
-
-
-def evaluate_accuracy(model, loader, device, max_batches=50):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for i, batch in enumerate(loader):
-            x = batch["image"].float().to(device)
-            y = batch["label"].to(device)
-
-            if x.ndim == 4 and x.shape[0] == 1 and x.shape[1] != 1:
-                x = x.permute(1, 0, 2, 3)
-            if x.ndim == 3:
-                x = x.unsqueeze(1)
-
-            try:
-                output = model(x)
-            except Exception:
-                return 0.0
-            pred = output.argmax(dim=1)
-            correct += (pred == y).sum().item()
-            total += y.size(0)
-
-            if i + 1 >= max_batches:
-                break
-
-    return correct / max(1, total)
-
-
-def mnist_transform(example):
-    image = example["image"]
-    if isinstance(image, list):
-        image = np.stack([np.array(im, dtype=np.float32) for im in image], axis=0)
-    else:
-        image = np.array(image, dtype=np.float32)
-
-    image = torch.from_numpy(image) / 255.0
-
-    if image.ndim == 2:
-        image = image.unsqueeze(0)
-    elif image.ndim == 3:
-        if image.shape[0] != 1:
-            image = image.unsqueeze(1)
-
-    label = example["label"]
-    if isinstance(label, list):
-        label = torch.tensor(label, dtype=torch.long)
-    else:
-        label = torch.tensor(label, dtype=torch.long)
-
-    return {"image": image, "label": label}
-
-
-def get_dataloaders(batch_size=64, num_workers=None):
-    dataset = load_dataset("mnist")
-    dataset = dataset.with_transform(mnist_transform)
-
-    if num_workers is None:
-        cpu_count = os.cpu_count() or 2
-        num_workers = max(1, min(8, cpu_count - 1))
-
-    loader_kwargs = {
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-        "pin_memory": torch.cuda.is_available(),
-    }
-    if num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
-
-    train_loader = DataLoader(dataset["train"], shuffle=True, **loader_kwargs)
-    test_loader = DataLoader(dataset["test"], shuffle=False, **loader_kwargs)
-    return train_loader, test_loader
-
-
-def run_evolution(
-    generations=20,
-    population_size=16,
-    elites=4,
-    mutation_rate=0.9,
-    crossover_rate=0.3,
-    training_steps=100,
-    val_batches=20,
-    val_batches_fast=10,
-    eval_every=3,
-    seed=42,
-    on_generation=None,
-    output_dir="output",
-    log_filename="evolution_log.json",
-):
-    device = get_device(use_directml=True, strict=True)
-    rng = np.random.RandomState(seed)
-    train_loader, test_loader = get_dataloaders(batch_size=64)
-
-    os.makedirs(output_dir, exist_ok=True)
-    log_path = os.path.join(output_dir, log_filename)
-    log_data = {
-        "meta": {
-            "started_at": datetime.utcnow().isoformat() + "Z",
-            "generations": generations,
-            "population_size": population_size,
-            "elites": elites,
-            "mutation_rate": mutation_rate,
-            "crossover_rate": crossover_rate,
-            "training_steps": training_steps,
-            "val_batches": val_batches,
-            "val_batches_fast": val_batches_fast,
-            "eval_every": eval_every,
-            "seed": seed,
-            "device": str(device),
-        },
-        "generations": [],
-    }
-
-    population = [build_minimal_model().to(device) for _ in range(population_size)]
-    for gen in range(generations):
-        scored = []
-
-        for model in population:
-            trained, steps_run = train_brief(model, train_loader, device, steps=training_steps)
-            params = count_parameters(model)
-            if not trained:
-                acc = 0.0
-                fitness = -1e9
-            else:
-                use_full = (gen % eval_every == 0)
-                max_batches = val_batches if use_full else val_batches_fast
-                acc = evaluate_accuracy(model, test_loader, device, max_batches=max_batches)
-                fitness = acc
-            scored.append((fitness, acc, params, model, steps_run))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        best_fitness, best_acc, best_params, best_model, best_steps = scored[0]
-        avg_acc = sum(s[1] for s in scored) / len(scored)
-        max_nodes_model = max(scored, key=lambda x: len(x[3].execution_order))[3]
-        max_nodes = len(max_nodes_model.execution_order)
-
-        print(f"Generation {gen} | Best Acc: {best_acc:.4f} | Avg Acc: {avg_acc:.4f} | Best Params: {best_params}")
-        print(f"Best Nodes: {len(best_model.execution_order)} | Arch: {describe_architecture(best_model)}")
-        print(f"Max Nodes: {max_nodes} | Arch: {describe_architecture(max_nodes_model)}")
-
-        gen_entry = {
-            "generation": gen,
-            "best_acc": float(best_acc),
-            "avg_acc": float(avg_acc),
-            "best_params": int(best_params),
-            "best_nodes": int(len(best_model.execution_order)),
-            "max_nodes": int(max_nodes),
-            "train_steps": int(best_steps),
-            "train_steps_max": int(training_steps),
-            "best_model": serialize_model(best_model),
-            "max_nodes_model": serialize_model(max_nodes_model),
-        }
-        log_data["generations"].append(gen_entry)
-        with open(log_path, "w", encoding="utf-8") as f:
-            json.dump(log_data, f, indent=2, ensure_ascii=True)
-
-        if on_generation is not None:
-            on_generation(
-                {
-                    "generation": gen,
-                    "best_acc": best_acc,
-                    "avg_acc": avg_acc,
-                    "best_params": best_params,
-                    "best_nodes": len(best_model.execution_order),
-                    "max_nodes": max_nodes,
-                    "train_steps": best_steps,
-                    "train_steps_max": training_steps,
-                    "best_model": best_model,
-                    "max_nodes_model": max_nodes_model,
-                }
+            n_params = count_params(model)
+            print(f"  Parameters: {n_params:,}")
+
+            # ── 3. Train & evaluate ──
+            accuracy = train_and_eval(
+                model, train_loader, val_loader,
+                epochs=CFG["child_epochs"], lr=CFG["child_lr"]
             )
+            reward = accuracy
+            print(f"  Val Accuracy: {accuracy*100:.2f}%")
 
-        next_population = []
-        for i in range(elites):
-            next_population.append(clone_model(scored[i][3]).to(device))
+            history.append({
+                "iteration": it,
+                "accuracy": round(accuracy, 5),
+                "params": n_params,
+                "arch": desc,
+            })
 
-        # Inject at least one growth mutation from the best model
-        if len(next_population) < population_size:
-            growth_parent = scored[0][3]
-            growth_child = mutate_model(growth_parent, rng, force="insert_layer")
-            growth_child.to(device)
-            if is_valid_model(growth_child, device):
-                next_population.append(growth_child)
+            best_archs.append((accuracy, desc, nodes, n_params))
+            best_archs.sort(key=lambda x: -x[0])
+            best_archs = best_archs[:CFG["top_k"]]
 
-        while len(next_population) < population_size:
-            fallback_parent = None
-            if rng.rand() < crossover_rate and len(scored) >= 2:
-                parent_a = scored[rng.randint(0, len(scored))][3]
-                parent_b = scored[rng.randint(0, len(scored))][3]
-                fallback_parent = parent_a
-                child = crossover_models_flexible(parent_a, parent_b)
-            else:
-                parent = scored[rng.randint(0, len(scored))][3]
-                fallback_parent = parent
-                child = clone_model(parent)
+        # ── 4. Controller update (REINFORCE + PPO clip) ──
+        controller.train()
 
-            if rng.rand() < mutation_rate:
-                child = mutate_model(child, rng)
+        if baseline is None:
+            baseline = reward
+        else:
+            baseline = CFG["baseline_decay"] * baseline + (1 - CFG["baseline_decay"]) * reward
 
-            child.to(device)
-            last_mut = getattr(child, "_last_mutation", "")
-            if last_mut in {"add_skip", "add_concat"}:
-                if not is_valid_model(child, device):
-                    child = clone_model(fallback_parent).to(device)
-            next_population.append(child)
+        advantage = reward - baseline
 
-        population = next_population
+        # Standard policy gradient
+        pg_loss = -(log_probs * advantage).sum()
+        ent_loss = -CFG["entropy_weight"] * entropies.sum()
+        loss = pg_loss + ent_loss
 
-    valid_population = [m for m in population if is_valid_model(m, device)]
-    if not valid_population:
-        print("No valid models in final population.")
-        return None
-    best = max(valid_population, key=lambda m: evaluate_accuracy(m, test_loader, device, max_batches=val_batches))
-    _ = train_full(best, train_loader, device, epochs=50)
-    final_acc = evaluate_accuracy(best, test_loader, device, max_batches=val_batches)
-    print("Final Best Accuracy (after full train):", final_acc)
-    print("Final Best Params:", count_parameters(best))
-    print("Final Best Arch:", describe_architecture(best))
+        ctrl_optim.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(controller.parameters(), 0.5)
+        ctrl_optim.step()
 
-    log_data["final"] = {
-        "final_acc": float(final_acc),
-        "final_params": int(count_parameters(best)),
-        "final_arch": describe_architecture(best),
-        "final_model": serialize_model(best),
-    }
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(log_data, f, indent=2, ensure_ascii=True)
-    return best
+        print(f"  Reward: {reward:.4f} | Baseline: {baseline:.4f} | "
+              f"Adv: {advantage:+.4f} | CtrlLoss: {loss.item():.3f}\n")
+
+    # ══ Report ══
+    print(f"\n{'═'*65}")
+    print("  TOP DISCOVERED ARCHITECTURES")
+    print(f"{'═'*65}")
+    for rank, (acc, desc, nodes, n_params) in enumerate(best_archs, 1):
+        print(f"\n  #{rank}  Accuracy: {acc*100:.2f}%  |  Params: {n_params:,}")
+        print(f"  Arch : {desc}")
+        if nodes:
+            print(f"  Layers:")
+            for i, n in enumerate(nodes, 1):
+                print(f"    {i:2d}. {n.op:15s} dim={n.dim} heads={n.heads} "
+                      f"ffn_expand={n.ffn_expand} dropout={n.dropout} kernel={n.kernel}")
+
+    if history:
+        accs = [h["accuracy"] for h in history]
+        print(f"\n{'═'*65}")
+        print(f"  Search Summary")
+        print(f"  Iterations   : {CFG['nas_iterations']}  ({failed} invalid)")
+        print(f"  Best accuracy: {max(accs)*100:.2f}%")
+        print(f"  Mean accuracy: {np.mean(accs)*100:.2f}%")
+        print(f"  Std           : {np.std(accs)*100:.2f}%")
+
+    with open("nas_results_v2.json", "w") as f:
+        json.dump({"history": history, "config": CFG}, f, indent=2)
+    print("\n  Search results saved → nas_results_v2.json")
+
+    # ══ Retrain Best ══
+    if not best_archs:
+        print("\n  No valid architectures found.")
+        return
+
+    print(f"\n{'═'*65}")
+    print("  RETRAINING BEST ARCHITECTURE ON FULL DATASET")
+    print(f"{'═'*65}")
+    best_acc, best_desc, best_nodes, _ = best_archs[0]
+    print(f"  Architecture : {best_desc}")
+    print(f"  NAS accuracy : {best_acc*100:.2f}%\n")
+
+    full_train, full_val = get_data()  # full dataset
+    final_model = compile_architecture(best_nodes, CFG["patch_size"])
+
+    if final_model is None:
+        print("  Could not recompile best architecture.")
+        return
+
+    print(f"  Parameters   : {count_params(final_model):,}")
+    final_model = final_model.to(DEVICE)
+
+    optimizer = optim.AdamW(final_model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG["final_epochs"])
+    criterion = nn.CrossEntropyLoss()
+
+    best_val = 0.0
+    for epoch in range(1, CFG["final_epochs"] + 1):
+        final_model.train()
+        total_loss = 0
+        batches = 0
+        for X, y in full_train:
+            X, y = X.to(DEVICE), y.to(DEVICE)
+            try:
+                optimizer.zero_grad()
+                loss = criterion(final_model(X), y)
+                loss.backward()
+                nn.utils.clip_grad_norm_(final_model.parameters(), 1.0)
+                optimizer.step()
+                total_loss += loss.item()
+                batches += 1
+            except Exception:
+                continue
+        scheduler.step()
+
+        final_model.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for X, y in full_val:
+                X, y = X.to(DEVICE), y.to(DEVICE)
+                try:
+                    preds = final_model(X).argmax(1)
+                    correct += (preds == y).sum().item()
+                    total += y.size(0)
+                except Exception:
+                    pass
+        val_acc = correct / total if total > 0 else 0
+        best_val = max(best_val, val_acc)
+
+        avg_loss = total_loss / batches if batches > 0 else float("nan")
+        print(f"  Epoch {epoch:2d}/{CFG['final_epochs']}  "
+              f"loss={avg_loss:.4f}  val_acc={val_acc*100:.2f}%  "
+              f"best={best_val*100:.2f}%")
+
+    torch.save(final_model.state_dict(), "best_nas_model_v2.pt")
+    print(f"\n  Model saved → best_nas_model_v2.pt")
+    print(f"  Final Best Validation Accuracy: {best_val*100:.2f}%")
+    print(f"{'═'*65}\n")
 
 
 if __name__ == "__main__":
-    run_evolution()
-    
+    torch.manual_seed(42)
+    random.seed(42)
+    np.random.seed(42)
+    run_nas()
