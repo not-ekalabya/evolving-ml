@@ -7,14 +7,15 @@ import numpy as np
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 
-def get_device(strict=True):
-    try:
-        import torch_directml
-        return torch_directml.device()
-    except Exception:
-        if strict:
-            raise RuntimeError("torch_directml not available; cannot use Radeon GPU.")
-        return "cuda" if torch.cuda.is_available() else "cpu"
+def get_device(use_directml=True, strict=True):
+    if use_directml:
+        try:
+            import torch_directml
+            return torch_directml.device()
+        except Exception:
+            if strict:
+                raise RuntimeError("torch_directml not available; cannot use DirectML GPU.")
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # =========================
@@ -846,7 +847,7 @@ def run_evolution(
     seed=42,
     on_generation=None,
 ):
-    device = get_device(strict=True)
+    device = get_device(use_directml=True, strict=True)
     rng = np.random.RandomState(seed)
 
     population = [build_minimal_model().to(device) for _ in range(population_size)]
