@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+import json
+from datetime import datetime
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 
@@ -322,6 +324,39 @@ def describe_architecture(model):
         else:
             parts.append(f"{name}:{type(node).__name__}")
     return " -> ".join(parts)
+
+
+def serialize_model(model):
+    nodes = {}
+    for name in model.execution_order:
+        node = model.nodes[name]
+        entry = {
+            "type": type(node).__name__,
+            "inputs": list(node.inputs),
+        }
+        if isinstance(node, MatMulNode):
+            entry["in_features"] = int(node.W.shape[0])
+            entry["out_features"] = int(node.W.shape[1])
+            entry["bias"] = node.b is not None
+        elif isinstance(node, ActivationNode):
+            entry["activation_type"] = node.activation_type
+        elif isinstance(node, ReshapeNode):
+            entry["operation"] = node.operation
+            entry["parameters"] = node.parameters
+        elif isinstance(node, ReduceNode):
+            entry["operation"] = node.operation
+            entry["dim"] = node.dim
+        elif isinstance(node, IndexNode):
+            entry["mode"] = node.mode
+            entry["parameters"] = node.parameters
+        elif isinstance(node, ConcatNode):
+            entry["dim"] = node.dim
+        nodes[name] = entry
+    return {
+        "execution_order": list(model.execution_order),
+        "nodes": nodes,
+        "last_mutation": getattr(model, "_last_mutation", None),
+    }
 
 
 def clone_model(parent):
@@ -676,10 +711,10 @@ def train_brief(model, loader, device, steps=100):
         try:
             output = model(x)
         except Exception:
-            return False
+            return False, step
         loss = criterion(output, y)
         if not loss.requires_grad:
-            return False
+            return False, step
         loss.backward()
         optimizer.step()
 
@@ -693,7 +728,7 @@ def train_brief(model, loader, device, steps=100):
         step += 1
         if step >= steps or no_improve >= 5:
             break
-    return True
+    return True, step
 
 
 def train_full(model, loader, device, epochs=3):
@@ -810,17 +845,39 @@ def run_evolution(
     eval_every=3,
     seed=42,
     on_generation=None,
+    output_dir="output",
+    log_filename="evolution_log.json",
 ):
     device = get_device(use_directml=True, strict=True)
     rng = np.random.RandomState(seed)
     train_loader, test_loader = get_dataloaders(batch_size=64)
+
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, log_filename)
+    log_data = {
+        "meta": {
+            "started_at": datetime.utcnow().isoformat() + "Z",
+            "generations": generations,
+            "population_size": population_size,
+            "elites": elites,
+            "mutation_rate": mutation_rate,
+            "crossover_rate": crossover_rate,
+            "training_steps": training_steps,
+            "val_batches": val_batches,
+            "val_batches_fast": val_batches_fast,
+            "eval_every": eval_every,
+            "seed": seed,
+            "device": str(device),
+        },
+        "generations": [],
+    }
 
     population = [build_minimal_model().to(device) for _ in range(population_size)]
     for gen in range(generations):
         scored = []
 
         for model in population:
-            trained = train_brief(model, train_loader, device, steps=training_steps)
+            trained, steps_run = train_brief(model, train_loader, device, steps=training_steps)
             params = count_parameters(model)
             if not trained:
                 acc = 0.0
@@ -830,10 +887,10 @@ def run_evolution(
                 max_batches = val_batches if use_full else val_batches_fast
                 acc = evaluate_accuracy(model, test_loader, device, max_batches=max_batches)
                 fitness = acc
-            scored.append((fitness, acc, params, model))
+            scored.append((fitness, acc, params, model, steps_run))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        best_fitness, best_acc, best_params, best_model = scored[0]
+        best_fitness, best_acc, best_params, best_model, best_steps = scored[0]
         avg_acc = sum(s[1] for s in scored) / len(scored)
         max_nodes_model = max(scored, key=lambda x: len(x[3].execution_order))[3]
         max_nodes = len(max_nodes_model.execution_order)
@@ -841,6 +898,22 @@ def run_evolution(
         print(f"Generation {gen} | Best Acc: {best_acc:.4f} | Avg Acc: {avg_acc:.4f} | Best Params: {best_params}")
         print(f"Best Nodes: {len(best_model.execution_order)} | Arch: {describe_architecture(best_model)}")
         print(f"Max Nodes: {max_nodes} | Arch: {describe_architecture(max_nodes_model)}")
+
+        gen_entry = {
+            "generation": gen,
+            "best_acc": float(best_acc),
+            "avg_acc": float(avg_acc),
+            "best_params": int(best_params),
+            "best_nodes": int(len(best_model.execution_order)),
+            "max_nodes": int(max_nodes),
+            "train_steps": int(best_steps),
+            "train_steps_max": int(training_steps),
+            "best_model": serialize_model(best_model),
+            "max_nodes_model": serialize_model(max_nodes_model),
+        }
+        log_data["generations"].append(gen_entry)
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(log_data, f, indent=2, ensure_ascii=True)
 
         if on_generation is not None:
             on_generation(
@@ -851,6 +924,8 @@ def run_evolution(
                     "best_params": best_params,
                     "best_nodes": len(best_model.execution_order),
                     "max_nodes": max_nodes,
+                    "train_steps": best_steps,
+                    "train_steps_max": training_steps,
                     "best_model": best_model,
                     "max_nodes_model": max_nodes_model,
                 }
@@ -897,11 +972,20 @@ def run_evolution(
         print("No valid models in final population.")
         return None
     best = max(valid_population, key=lambda m: evaluate_accuracy(m, test_loader, device, max_batches=val_batches))
-    _ = train_full(best, train_loader, device, epochs=3)
+    _ = train_full(best, train_loader, device, epochs=50)
     final_acc = evaluate_accuracy(best, test_loader, device, max_batches=val_batches)
     print("Final Best Accuracy (after full train):", final_acc)
     print("Final Best Params:", count_parameters(best))
     print("Final Best Arch:", describe_architecture(best))
+
+    log_data["final"] = {
+        "final_acc": float(final_acc),
+        "final_params": int(count_parameters(best)),
+        "final_arch": describe_architecture(best),
+        "final_model": serialize_model(best),
+    }
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(log_data, f, indent=2, ensure_ascii=True)
     return best
 
 

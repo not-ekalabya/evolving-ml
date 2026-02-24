@@ -10,14 +10,15 @@ Design language:
   • Evolution runs on daemon thread; UI on main thread via queue
 """
 
+import json
 import math
+import os
 import queue
-import threading
+import sys
+import time
 import tkinter as tk
 from collections import deque
 from typing import Optional
-
-import main
 
 # ── palette (light, minimal) ──────────────────────────────────────────────────
 BG          = "#f8f9fb"
@@ -52,12 +53,33 @@ def _fam(size, bold=False):
 # ── node metadata ─────────────────────────────────────────────────────────────
 
 def _node_type_key(node) -> str:
-    return "input" if node is None else type(node).__name__
+    if node is None:
+        return "input"
+    if isinstance(node, dict):
+        return node.get("type", "default")
+    return type(node).__name__
 
 def _node_short(name: str, node):
     """Return (top_line, sub_line)."""
     if node is None:
         return ("input", "")
+    if isinstance(node, dict):
+        t = node.get("type", "Unknown")
+        if t == "MatMulNode":
+            return ("MatMul", f"{node.get('in_features','?')}→{node.get('out_features','?')}")
+        if t == "ActivationNode":
+            return (node.get("activation_type", "act"), "activation")
+        if t == "ReshapeNode":
+            return ("Reshape", str(node.get("operation", ""))[:12])
+        if t == "AddNode":
+            return ("Add", "")
+        if t == "ConcatNode":
+            return ("Concat", "")
+        if t == "ReduceNode":
+            return ("Reduce", str(node.get("operation", ""))[:12])
+        if t == "IndexNode":
+            return ("Index", str(node.get("mode", ""))[:12])
+        return (t[:12], "")
     t = type(node).__name__
     if t == "MatMulNode":
         return ("MatMul", f"{node.W.shape[0]}→{node.W.shape[1]}")
@@ -104,8 +126,9 @@ def _layout(model, W, H):
 
     for name in model.execution_order:
         node = model.nodes[name]
-        if node.inputs:
-            xs = [pos[s][0] for s in node.inputs if s in pos]
+        inputs = node.get("inputs", []) if isinstance(node, dict) else node.inputs
+        if inputs:
+            xs = [pos[s][0] for s in inputs if s in pos]
             if xs:
                 pos[name][0] = sum(xs) / len(xs)
 
@@ -134,6 +157,76 @@ class Particle:
         self.speed = 0.006 + 0.002 * (abs(hash(key)) % 5) / 5
 
 
+class ModelView:
+    def __init__(self, data: dict):
+        self.execution_order = list(data.get("execution_order", []))
+        self.nodes = dict(data.get("nodes", {}))
+        self._last_mutation = data.get("last_mutation", None)
+
+
+def describe_architecture_serialized(model: ModelView):
+    parts = []
+    for name in model.execution_order:
+        node = model.nodes[name]
+        t = node.get("type", "Unknown")
+        if t == "ReshapeNode":
+            parts.append(f"{name}:Reshape({node.get('operation', '')})")
+        elif t == "MatMulNode":
+            parts.append(f"{name}:MatMul({node.get('in_features','?')}->{node.get('out_features','?')})")
+        elif t == "ActivationNode":
+            parts.append(f"{name}:Act({node.get('activation_type', '')})")
+        elif t == "AddNode":
+            parts.append(f"{name}:Add")
+        elif t == "ConcatNode":
+            parts.append(f"{name}:Concat(dim={node.get('dim', '')})")
+        elif t == "ReduceNode":
+            parts.append(f"{name}:Reduce({node.get('operation', '')})")
+        elif t == "IndexNode":
+            parts.append(f"{name}:Index({node.get('mode', '')})")
+        else:
+            parts.append(f"{name}:{t}")
+    return " -> ".join(parts)
+
+
+def _find_latest_log(output_dir="output"):
+    if not os.path.isdir(output_dir):
+        return None
+    candidates = [
+        os.path.join(output_dir, f)
+        for f in os.listdir(output_dir)
+        if f.lower().endswith(".json")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
+
+
+def _load_stats(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    gens = data.get("generations", [])
+    stats = []
+    for g in gens:
+        best_model = ModelView(g["best_model"])
+        max_nodes_model = ModelView(g.get("max_nodes_model", g["best_model"]))
+        stats.append(
+            {
+                "generation": g.get("generation"),
+                "best_acc": g.get("best_acc", 0.0),
+                "avg_acc": g.get("avg_acc", 0.0),
+                "best_params": g.get("best_params", 0),
+                "best_nodes": g.get("best_nodes", 0),
+                "max_nodes": g.get("max_nodes", 0),
+                "train_steps": g.get("train_steps", 0),
+                "train_steps_max": g.get("train_steps_max", 0),
+                "best_model": best_model,
+                "max_nodes_model": max_nodes_model,
+                "mutation": g.get("best_model", {}).get("last_mutation"),
+            }
+        )
+    return stats
+
+
 # ── app ───────────────────────────────────────────────────────────────────────
 
 class EvolutionViz:
@@ -157,6 +250,10 @@ class EvolutionViz:
         self._fresh             = False
         self._acc_hist: deque   = deque(maxlen=100)
         self._param_hist: deque = deque(maxlen=100)
+        self._playback: list    = []
+        self._play_idx          = 0
+        self._play_interval     = 0.9
+        self._next_play         = 0.0
 
         self._build_ui()
         self._loop()
@@ -201,6 +298,7 @@ class EvolutionViz:
             ("best_params", "Parameters"),
             ("best_nodes",  "Nodes"),
             ("max_nodes",   "Max nodes"),
+            ("train_steps", "Train steps"),
             ("mutation",    "Last mutation"),
         ]:
             f = tk.Frame(pnl, bg=PANEL_BG)
@@ -252,6 +350,13 @@ class EvolutionViz:
     # ── main loop ─────────────────────────────────────────────────────────────
 
     def _loop(self):
+        if self._playback and self._play_idx < len(self._playback):
+            now = time.monotonic()
+            if now >= self._next_play:
+                self._apply_stats(self._playback[self._play_idx])
+                self._play_idx += 1
+                self._next_play = now + self._play_interval
+
         self._fresh = False
         try:
             while True:
@@ -285,9 +390,12 @@ class EvolutionViz:
         mv["best_params"].set(f"{stats.get('best_params', 0):,}")
         mv["best_nodes"].set(str(stats.get("best_nodes", "—")))
         mv["max_nodes"].set(str(stats.get("max_nodes", "—")))
-        mutation = getattr(model, "_last_mutation", "n/a")
+        steps = stats.get("train_steps", 0)
+        steps_max = stats.get("train_steps_max", 0)
+        mv["train_steps"].set(f"{steps}/{steps_max}" if steps_max else str(steps))
+        mutation = stats.get("mutation", getattr(model, "_last_mutation", "n/a"))
         mv["mutation"].set(str(mutation)[:24])
-        self._arch_var.set(main.describe_architecture(model)[:200])
+        self._arch_var.set(describe_architecture_serialized(model)[:200])
 
         self._acc_hist.append(stats.get("best_acc", 0))
         self._param_hist.append(stats.get("best_params", 0))
@@ -299,7 +407,8 @@ class EvolutionViz:
         self._particles.clear()
         for name in model.execution_order:
             node = model.nodes[name]
-            for src in node.inputs:
+            inputs = node.get("inputs", []) if isinstance(node, dict) else node.inputs
+            for src in inputs:
                 x1, y1 = self._pos.get(src, (W/2, 0))
                 x2, y2 = self._pos.get(name, (W/2, H))
                 dy = abs(y2 - y1) * 0.5
@@ -466,10 +575,13 @@ class EvolutionViz:
     # ── run ───────────────────────────────────────────────────────────────────
 
     def run(self):
-        threading.Thread(
-            target=lambda: main.run_evolution(on_generation=self.on_generation),
-            daemon=True,
-        ).start()
+        path = sys.argv[1] if len(sys.argv) > 1 else _find_latest_log()
+        if path is None:
+            self._gen_var.set("No JSON log found")
+        else:
+            self._playback = _load_stats(path)
+            self._play_idx = 0
+            self._next_play = time.monotonic()
         self.root.mainloop()
 
 

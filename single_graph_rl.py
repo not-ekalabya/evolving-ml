@@ -59,7 +59,7 @@ def run_single_graph_rl(
     policy_opt = torch.optim.Adam(policy.parameters(), lr=1e-3)
 
     model = main.build_minimal_model().to(device)
-    _ = main.train_brief(model, train_loader, device, steps=training_steps)
+    _, _steps = main.train_brief(model, train_loader, device, steps=training_steps)
     last_acc = main.evaluate_accuracy(model, test_loader, device, max_batches=val_batches)
     last_reward = 0.0
     no_improve = 0
@@ -106,7 +106,7 @@ def run_single_graph_rl(
             reward = -0.1
             accept = False
         else:
-            trained = main.train_brief(candidate, train_loader, device, steps=training_steps)
+            trained, _steps = main.train_brief(candidate, train_loader, device, steps=training_steps)
             if not trained:
                 reward = -0.1
                 accept = False
@@ -143,7 +143,7 @@ def run_single_graph_rl(
                 candidate.to(device)
                 if main.is_valid_model(candidate, device):
                     model = candidate
-                    _ = main.train_brief(model, train_loader, device, steps=training_steps)
+                    _, _steps = main.train_brief(model, train_loader, device, steps=training_steps)
                     last_acc = main.evaluate_accuracy(model, test_loader, device, max_batches=val_batches)
                     last_reward = 0.0
                     no_improve = 0
