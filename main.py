@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import os
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 
@@ -751,49 +752,7 @@ def evaluate_accuracy(model, loader, device, max_batches=50):
     return correct / max(1, total)
 
 
-def get_dataloaders(batch_size=64):
-    dataset = load_dataset("mnist")
-
-    def transform(example):
-        image = example["image"]
-        if isinstance(image, list):
-            image = np.stack([np.array(im, dtype=np.float32) for im in image], axis=0)
-        else:
-            image = np.array(image, dtype=np.float32)
-
-        image = torch.from_numpy(image) / 255.0
-
-        if image.ndim == 2:
-            image = image.unsqueeze(0)
-        elif image.ndim == 3:
-            if image.shape[0] != 1:
-                image = image.unsqueeze(1)
-
-        label = example["label"]
-        if isinstance(label, list):
-            label = torch.tensor(label, dtype=torch.long)
-        else:
-            label = torch.tensor(label, dtype=torch.long)
-
-        return {"image": image, "label": label}
-
-    dataset = dataset.with_transform(transform)
-
-    train_loader = DataLoader(dataset["train"], batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(dataset["test"], batch_size=batch_size)
-    return train_loader, test_loader
-
-
-# =========================
-# Load MNIST via datasets
-# =========================
-
-dataset = load_dataset("mnist")
-
-
-def transform(example):
-
-    # Convert PIL -> numpy -> torch and normalize to [0, 1]
+def mnist_transform(example):
     image = example["image"]
     if isinstance(image, list):
         image = np.stack([np.array(im, dtype=np.float32) for im in image], axis=0)
@@ -802,7 +761,6 @@ def transform(example):
 
     image = torch.from_numpy(image) / 255.0
 
-    # Ensure channel dimension exists (1, 28, 28) or (B, 1, 28, 28)
     if image.ndim == 2:
         image = image.unsqueeze(0)
     elif image.ndim == 3:
@@ -818,20 +776,26 @@ def transform(example):
     return {"image": image, "label": label}
 
 
+def get_dataloaders(batch_size=64, num_workers=None):
+    dataset = load_dataset("mnist")
+    dataset = dataset.with_transform(mnist_transform)
 
-dataset = dataset.with_transform(transform)
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 2
+        num_workers = max(1, min(8, cpu_count - 1))
 
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
 
-train_loader = DataLoader(
-    dataset["train"],
-    batch_size=64,
-    shuffle=True
-)
-
-test_loader = DataLoader(
-    dataset["test"],
-    batch_size=64
-)
+    train_loader = DataLoader(dataset["train"], shuffle=True, **loader_kwargs)
+    test_loader = DataLoader(dataset["test"], shuffle=False, **loader_kwargs)
+    return train_loader, test_loader
 
 
 def run_evolution(
@@ -849,16 +813,14 @@ def run_evolution(
 ):
     device = get_device(use_directml=True, strict=True)
     rng = np.random.RandomState(seed)
+    train_loader, test_loader = get_dataloaders(batch_size=64)
 
     population = [build_minimal_model().to(device) for _ in range(population_size)]
     for gen in range(generations):
         scored = []
 
         for model in population:
-            if not is_valid_model(model, device):
-                trained = False
-            else:
-                trained = train_brief(model, train_loader, device, steps=training_steps)
+            trained = train_brief(model, train_loader, device, steps=training_steps)
             params = count_parameters(model)
             if not trained:
                 acc = 0.0

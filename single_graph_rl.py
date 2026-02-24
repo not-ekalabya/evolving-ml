@@ -90,20 +90,22 @@ def run_single_graph_rl(
 
         candidate = None
         ok = False
+        candidate_is_valid = False
         for _ in range(5):
             candidate, ok = main.apply_mutation_action(model, rng, action)
             if ok:
                 candidate.to(device)
-                if main.is_valid_model(candidate, device):
+                candidate_is_valid = main.is_valid_model(candidate, device)
+                if candidate_is_valid:
                     break
             candidate = None
             ok = False
+            candidate_is_valid = False
 
-        if not ok or not main.is_valid_model(candidate, device):
+        if not ok or not candidate_is_valid:
             reward = -0.1
             accept = False
         else:
-            candidate.to(device)
             trained = main.train_brief(candidate, train_loader, device, steps=training_steps)
             if not trained:
                 reward = -0.1
